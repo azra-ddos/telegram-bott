@@ -1,11 +1,12 @@
 {
   "name": "telegram-multifunction-bot",
-  "version": "1.0.0",
-  "description": "Advanced Telegram Bot with multiple features",
+  "version": "2.0.0",
+  "description": "Advanced Telegram Bot with multiple features - Enhanced Version",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
-    "dev": "nodemon bot.js"
+    "dev": "nodemon bot.js",
+    "setup": "node setup.js"
   },
   "dependencies": {
     "telegraf": "^4.15.3",
@@ -15,12 +16,16 @@
     "fluent-ffmpeg": "^2.1.2",
     "form-data": "^4.0.0",
     "qrcode": "^1.5.3",
-    "tiktok-scraper": "^1.4.40"
+    "node-cron": "^3.0.2",
+    "moment": "^2.29.4",
+    "cheerio": "^1.0.0-rc.12",
+    "image-size": "^1.1.1",
+    "valid-url": "^1.0.9"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"
   },
-  "keywords": ["telegram", "bot", "multifunction"],
-  "author": "azra",
+  "keywords": ["telegram", "bot", "multifunction", "advanced"],
+  "author": "Your Name",
   "license": "MIT"
 }
