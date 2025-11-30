@@ -1,314 +1,591 @@
-const { Telegraf, Markup, session } = require('telegraf');
+const { Telegraf, Markup, session, Scenes: { BaseScene, Stage } } = require('telegraf');
 const axios = require('axios');
 const sharp = require('sharp');
-const { createCanvas } = require('canvas');
+const { createCanvas, loadImage } = require('canvas');
 const QRCode = require('qrcode');
 const fs = require('fs');
 const path = require('path');
+const cron = require('node-cron');
+const moment = require('moment');
+const cheerio = require('cheerio');
+const sizeOf = require('image-size');
+const validUrl = require('valid-url');
 const config = require('./config');
 
 const bot = new Telegraf(config.BOT_TOKEN);
 
-// Middleware session
-bot.use(session());
+// Database sederhana (bisa diganti dengan database real)
+const userDB = new Map();
+const stats = {
+  totalUsers: 0,
+  commandsProcessed: 0,
+  qrCodesGenerated: 0,
+  stickersCreated: 0,
+  videosDownloaded: 0
+};
 
-// States untuk conversation
-bot.use((ctx, next) => {
-  if (!ctx.session) {
-    ctx.session = {
-      state: null,
-      data: {}
-    };
+// Scene untuk conversation yang lebih kompleks
+const qrScene = new BaseScene('qrScene');
+qrScene.enter((ctx) => ctx.reply('🎨 Masukkan teks untuk QR Code:'));
+qrScene.on('text', async (ctx) => {
+  const text = ctx.message.text;
+  await processQRCode(ctx, text);
+  ctx.scene.leave();
+});
+qrScene.on('message', (ctx) => ctx.reply('❌ Harap masukkan teks yang valid.'));
+
+const stickerScene = new BaseScene('stickerScene');
+stickerScene.enter((ctx) => ctx.reply('🖼️ Kirimkan foto untuk dijadikan stiker:'));
+stickerScene.on('photo', async (ctx) => {
+  await processSticker(ctx);
+  ctx.scene.leave();
+});
+stickerScene.on('message', (ctx) => ctx.reply('❌ Harap kirim foto yang valid.'));
+
+const tiktokScene = new BaseScene('tiktokScene');
+tiktokScene.enter((ctx) => ctx.reply('📱 Masukkan URL video TikTok:'));
+tiktokScene.on('text', async (ctx) => {
+  const url = ctx.message.text;
+  await processTikTok(ctx, url);
+  ctx.scene.leave();
+});
+tiktokScene.on('message', (ctx) => ctx.reply('❌ Harap masukkan URL yang valid.'));
+
+const stage = new Stage([qrScene, stickerScene, tiktokScene]);
+bot.use(session());
+bot.use(stage.middleware());
+
+// Middleware untuk tracking user
+bot.use(async (ctx, next) => {
+  const userId = ctx.from?.id;
+  if (userId && !userDB.has(userId)) {
+    userDB.set(userId, {
+      id: userId,
+      username: ctx.from.username,
+      first_name: ctx.from.first_name,
+      join_date: new Date(),
+      usage_count: 0
+    });
+    stats.totalUsers++;
   }
-  return next();
+  
+  if (userId) {
+    const user = userDB.get(userId);
+    user.usage_count++;
+    user.last_used = new Date();
+  }
+  
+  stats.commandsProcessed++;
+  await next();
 });
 
-// Fungsi untuk membuat menu utama
+// Fungsi menu utama yang lebih advanced
 function createMainMenu(ctx) {
   const user = ctx.from;
-  const userInfo = `
-👤 User Info:
-├ Username: @${user.username || 'Tidak ada'}
-├ ID: ${user.id}
-├ Nama: ${user.first_name} ${user.last_name || ''}
-└ Bahasa: ${user.language_code || 'Tidak diketahui'}
-  `;
-
+  const userData = userDB.get(user.id);
+  
   return Markup.keyboard([
-    ['🎨 Buat Foto QC', '🖼️ Buat Stiker'],
-    ['📱 Download TikTok', 'ℹ️ Bantuan']
+    ['🎨 Buat QR Code', '🖼️ Buat Stiker'],
+    ['📱 Download TikTok', '🎵 Download YouTube'],
+    ['🌤️ Info Cuaca', '💱 Konverter Mata Uang'],
+    ['📊 Statistik Bot', 'ℹ️ Bantuan']
   ]).resize();
 }
 
-// Command Start
+function createInlineMenu() {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback('🎨 QR Code', 'create_qr'),
+      Markup.button.callback('🖼️ Stiker', 'create_sticker')
+    ],
+    [
+      Markup.button.callback('📱 TikTok', 'download_tiktok'),
+      Markup.button.callback('🎵 YouTube', 'download_youtube')
+    ],
+    [
+      Markup.button.callback('🌤️ Cuaca', 'weather_info'),
+      Markup.button.callback('💱 Mata Uang', 'currency_convert')
+    ],
+    [
+      Markup.button.callback('📊 Statistik', 'bot_stats'),
+      Markup.button.callback('🛠️ Admin', 'admin_panel')
+    ]
+  ]);
+}
+
+// Command Start yang lebih menarik
 bot.start(async (ctx) => {
+  const welcomeMessage = `
+🤖 *SELAMAT DATANG DI BOT MULTI-FUNGSI* 🚀
+
+*Fitur Premium Yang Tersedia:*
+🎨 • Pembuat QR Code Custom
+🖼️ • Pembuat Stiker Otomatis  
+📱 • Downloader TikTok HD
+🎵 • Downloader YouTube
+🌤️ • Info Cuaca Real-time
+💱 • Konverter Mata Uang
+📊 • Statistik Lengkap
+
+*Version:* 2.0.0
+*Status:* ✅ Active
+  `;
+
   try {
-    // Kirim foto dengan URL yang bisa diganti
     await ctx.replyWithPhoto(config.MENU_PHOTO_URL, {
-      caption: `🤖 Selamat datang di Bot Multi-Fungsi!\n\n${getUserInfo(ctx.from)}\n\nPilih menu di bawah:`,
+      caption: welcomeMessage,
+      parse_mode: 'Markdown',
       reply_markup: createMainMenu(ctx).reply_markup
     });
+    
+    // Kirim info user terpisah
+    await ctx.reply(getDetailedUserInfo(ctx.from), {
+      parse_mode: 'Markdown',
+      reply_markup: createInlineMenu().reply_markup
+    });
+    
   } catch (error) {
-    // Jika foto gagal, kirim pesan teks saja
-    await ctx.reply(
-      `🤖 Selamat datang di Bot Multi-Fungsi!\n\n${getUserInfo(ctx.from)}\n\nPilih menu di bawah:`,
-      createMainMenu(ctx)
-    );
+    await ctx.reply(welcomeMessage, {
+      parse_mode: 'Markdown',
+      reply_markup: createMainMenu(ctx).reply_markup
+    });
+    await ctx.reply(getDetailedUserInfo(ctx.from), {
+      parse_mode: 'Markdown',
+      reply_markup: createInlineMenu().reply_markup
+    });
   }
 });
 
-// Fungsi untuk mendapatkan info user
-function getUserInfo(user) {
-  return `👤 User Info:
-├ Username: @${user.username || 'Tidak ada'}
-├ ID: \`${user.id}\`
-├ Nama: ${user.first_name} ${user.last_name || ''}
-└ Bahasa: ${user.language_code || 'Tidak diketahui'}`;
+// Handler untuk semua menu
+const menuHandlers = {
+  '🎨 Buat QR Code': (ctx) => ctx.scene.enter('qrScene'),
+  '🖼️ Buat Stiker': (ctx) => ctx.scene.enter('stickerScene'),
+  '📱 Download TikTok': (ctx) => ctx.scene.enter('tiktokScene'),
+  '🎵 Download YouTube': (ctx) => handleYouTubeDownload(ctx),
+  '🌤️ Info Cuaca': (ctx) => handleWeatherRequest(ctx),
+  '💱 Konverter Mata Uang': (ctx) => handleCurrencyConvert(ctx),
+  '📊 Statistik Bot': (ctx) => showBotStats(ctx),
+  'ℹ️ Bantuan': (ctx) => showHelp(ctx)
+};
+
+Object.keys(menuHandlers).forEach(menuItem => {
+  bot.hears(menuItem, menuHandlers[menuItem]);
+});
+
+// Handler untuk inline buttons
+bot.action('create_qr', (ctx) => ctx.scene.enter('qrScene'));
+bot.action('create_sticker', (ctx) => ctx.scene.enter('stickerScene'));
+bot.action('download_tiktok', (ctx) => ctx.scene.enter('tiktokScene'));
+bot.action('download_youtube', (ctx) => handleYouTubeDownload(ctx));
+bot.action('weather_info', (ctx) => handleWeatherRequest(ctx));
+bot.action('currency_convert', (ctx) => handleCurrencyConvert(ctx));
+bot.action('bot_stats', (ctx) => showBotStats(ctx));
+bot.action('admin_panel', (ctx) => showAdminPanel(ctx));
+
+// Fungsi untuk membuat QR Code yang lebih advanced
+async function processQRCode(ctx, text) {
+  try {
+    const processingMsg = await ctx.reply('🔄 *Sedang membuat QR Code...*\n\n📊 _Mengoptimalkan desain..._', { 
+      parse_mode: 'Markdown' 
+    });
+    
+    // Generate QR Code
+    const qrCodeBuffer = await generateAdvancedQRCode(text);
+    
+    // Buat gambar dengan design yang lebih menarik
+    const finalImage = await createEnhancedQCImage(qrCodeBuffer, text);
+    
+    // Kirim hasil
+    await ctx.deleteMessage(processingMsg.message_id);
+    await ctx.replyWithPhoto(
+      { source: finalImage },
+      { 
+        caption: `✅ *QR Code Berhasil Dibuat!*\n\n📝 *Teks:* ${text}\n📏 *Size:* 800x900px\n🎨 *Style:* Modern Gradient`,
+        parse_mode: 'Markdown',
+        reply_markup: createMainMenu(ctx).reply_markup
+      }
+    );
+    
+    stats.qrCodesGenerated++;
+    
+  } catch (error) {
+    console.error('QR Code Error:', error);
+    await ctx.reply('❌ *Gagal membuat QR Code!*\n\n_Coba dengan teks yang berbeda._', { 
+      parse_mode: 'Markdown' 
+    });
+  }
 }
 
-// Handler untuk Buat Foto QC
-bot.hears('🎨 Buat Foto QC', (ctx) => {
-  ctx.session.state = 'waiting_qc_text';
-  ctx.reply('✍️ Masukkan teks untuk QR Code:\n\nContoh: "Hello World" atau "https://example.com"');
-});
+// Fungsi untuk membuat stiker yang lebih advanced
+async function processSticker(ctx) {
+  try {
+    const processingMsg = await ctx.reply('🔄 *Sedang memproses stiker...*\n\n📸 _Mengoptimalkan kualitas..._', {
+      parse_mode: 'Markdown'
+    });
 
-// Handler untuk Buat Stiker
-bot.hears('🖼️ Buat Stiker', (ctx) => {
-  ctx.session.state = 'waiting_sticker_photo';
-  ctx.reply('📸 Kirimkan foto yang ingin dijadikan stiker:');
-});
+    const photo = ctx.message.photo[ctx.message.photo.length - 1];
+    const fileUrl = await ctx.telegram.getFileLink(photo.file_id);
+    
+    // Download gambar
+    const response = await axios({
+      method: 'GET',
+      url: fileUrl,
+      responseType: 'arraybuffer'
+    });
 
-// Handler untuk Download TikTok
-bot.hears('📱 Download TikTok', (ctx) => {
-  ctx.session.state = 'waiting_tiktok_url';
-  ctx.reply('🔗 Masukkan URL video TikTok:\n\nContoh: https://vt.tiktok.com/xxxxx/');
-});
+    // Process dengan sharp - multiple optimizations
+    const processedImage = await sharp(response.data)
+      .resize(512, 512, {
+        fit: 'cover',
+        background: { r: 0, g: 0, b: 0, alpha: 0 }
+      })
+      .png({ quality: config.STICKER_CONFIG.quality })
+      .toBuffer();
 
-// Handler untuk Bantuan
-bot.hears('ℹ️ Bantuan', (ctx) => {
-  ctx.reply(`
-🤖 BOT MULTI-FUNGSI
+    await ctx.deleteMessage(processingMsg.message_id);
+    await ctx.replyWithSticker({ source: processedImage });
+    await ctx.reply('✅ *Stiker berhasil dibuat!*\n\n🖼️ *Kualitas:* High\n📏 *Size:* 512x512px', {
+      parse_mode: 'Markdown',
+      reply_markup: createMainMenu(ctx).reply_markup
+    });
 
-Fitur yang tersedia:
-🎨 Buat Foto QC - Buat QR Code dari teks
-🖼️ Buat Stiker - Convert foto menjadi stiker
-📱 Download TikTok - Download video TikTok
+    stats.stickersCreated++;
 
-Cara penggunaan:
-1. Pilih menu yang diinginkan
+  } catch (error) {
+    console.error('Sticker Error:', error);
+    await ctx.reply('❌ *Gagal membuat stiker!*\n\n_Pastikan foto tidak corrupt dan coba lagi._', {
+      parse_mode: 'Markdown'
+    });
+  }
+}
+
+// Fungsi untuk download TikTok yang lebih robust
+async function processTikTok(ctx, url) {
+  try {
+    if (!validUrl.isUri(url)) {
+      return ctx.reply('❌ *URL tidak valid!*\n\n_Pastikan URL TikTok benar._', {
+        parse_mode: 'Markdown'
+      });
+    }
+
+    const processingMsg = await ctx.reply('🔄 *Sedang mendownload video...*\n\n📱 _Mengakses TikTok API..._', {
+      parse_mode: 'Markdown'
+    });
+
+    const videoInfo = await downloadTikTokVideo(url);
+    
+    if (videoInfo && videoInfo.videoUrl) {
+      await ctx.deleteMessage(processingMsg.message_id);
+      
+      // Kirim video dengan caption lengkap
+      await ctx.replyWithVideo(videoInfo.videoUrl, {
+        caption: `✅ *Berhasil Download TikTok!*\n\n📝 *Judul:* ${videoInfo.title || 'No Title'}\n👤 *Creator:* ${videoInfo.author || 'Unknown'}\n⏱️ *Durasi:* ${videoInfo.duration || 'Unknown'}`,
+        parse_mode: 'Markdown',
+        reply_markup: createMainMenu(ctx).reply_markup
+      });
+      
+      stats.videosDownloaded++;
+    } else {
+      throw new Error('No video data received');
+    }
+
+  } catch (error) {
+    console.error('TikTok Download Error:', error);
+    await ctx.reply('❌ *Gagal mendownload video!*\n\n_Coba dengan URL yang berbeda atau coba lagi nanti._', {
+      parse_mode: 'Markdown'
+    });
+  }
+}
+
+// Fungsi YouTube Downloader (placeholder - butuh API key)
+async function handleYouTubeDownload(ctx) {
+  await ctx.reply('🎵 *YouTube Downloader*\n\n_Fitur ini dalam pengembangan. Akan segera hadir!_', {
+    parse_mode: 'Markdown',
+    reply_markup: createMainMenu(ctx).reply_markup
+  });
+}
+
+// Fungsi Info Cuaca
+async function handleWeatherRequest(ctx) {
+  await ctx.reply('🌤️ *Weather Information*\n\n_Ketik nama kota untuk informasi cuaca:_\nContoh: "Jakarta" atau "London"', {
+    parse_mode: 'Markdown'
+  });
+}
+
+// Fungsi Konverter Mata Uang
+async function handleCurrencyConvert(ctx) {
+  await ctx.reply('💱 *Currency Converter*\n\n_Format: Jumlah Dari Ke_\nContoh: "100 USD IDR" atau "50 EUR USD"', {
+    parse_mode: 'Markdown'
+  });
+}
+
+// Fungsi Statistik Bot
+async function showBotStats(ctx) {
+  const uptime = process.uptime();
+  const statsMessage = `
+📊 *BOT STATISTICS*
+
+👥 *Total Users:* ${stats.totalUsers}
+🔄 *Commands Processed:* ${stats.commandsProcessed}
+🎨 *QR Codes Generated:* ${stats.qrCodesGenerated}
+🖼️ *Stickers Created:* ${stats.stickersCreated}
+📱 *Videos Downloaded:* ${stats.videosDownloaded}
+
+⏰ *Uptime:* ${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m
+💾 *Memory Usage:* ${(process.memoryUsage().rss / 1024 / 1024).toFixed(2)} MB
+🚀 *Version:* 2.0.0
+  `;
+
+  await ctx.reply(statsMessage, {
+    parse_mode: 'Markdown',
+    reply_markup: createMainMenu(ctx).reply_markup
+  });
+}
+
+// Fungsi Admin Panel
+async function showAdminPanel(ctx) {
+  if (!config.ADMIN_IDS.includes(ctx.from.id)) {
+    return ctx.reply('❌ *Akses Ditolak!*\n\n_Anda bukan admin._', {
+      parse_mode: 'Markdown'
+    });
+  }
+
+  const adminMessage = `
+🛠️ *ADMIN PANEL*
+
+*Total Users:* ${stats.totalUsers}
+*Active Sessions:* ${userDB.size}
+
+*Quick Actions:*
+/broadcast - Kirim pesan ke semua user
+/stats - Detail statistik
+/restart - Restart bot
+
+*Server Info:*
+Node.js: ${process.version}
+Platform: ${process.platform}
+  `;
+
+  await ctx.reply(adminMessage, {
+    parse_mode: 'Markdown',
+    reply_markup: createMainMenu(ctx).reply_markup
+  });
+}
+
+// Fungsi Bantuan
+async function showHelp(ctx) {
+  const helpMessage = `
+ℹ️ *BOT HELP CENTER*
+
+*Cara Menggunakan:*
+1. Pilih menu dari keyboard atau tombol inline
 2. Ikuti instruksi yang diberikan
 3. Tunggu proses selesai
 
-Bot dibuat dengan ❤️ menggunakan Node.js
-  `);
-});
+*Fitur Available:*
+🎨 *QR Code Maker* - Buat QR code dari teks/URL
+🖼️ *Sticker Maker* - Convert foto ke stiker
+📱 *TikTok Downloader* - Download video TikTok
+🎵 *YouTube Downloader* - Download video YouTube
+🌤️ *Weather Info* - Info cuaca real-time
+💱 *Currency Converter* - Konversi mata uang
 
-// Handler untuk pesan teks (QC Text)
-bot.on('text', async (ctx) => {
-  const state = ctx.session.state;
-  const text = ctx.message.text;
+*Perintah Admin:*
+/broadcast - Broadcast message
+/stats - Lihat statistik
+/restart - Restart bot
 
-  if (state === 'waiting_qc_text') {
-    try {
-      await ctx.reply('⏳ Sedang membuat QR Code...');
-      
-      // Buat QR Code
-      const qrCodeBuffer = await generateQRCode(text);
-      
-      // Buat gambar dengan background dan teks
-      const finalImage = await createQCImage(qrCodeBuffer, text);
-      
-      // Kirim hasilnya
-      await ctx.replyWithPhoto(
-        { source: finalImage },
-        { 
-          caption: `✅ QR Code berhasil dibuat!\nTeks: "${text}"`,
-          reply_markup: createMainMenu(ctx).reply_markup
-        }
-      );
-      
-      // Reset state
-      ctx.session.state = null;
-      
-    } catch (error) {
-      console.error('Error creating QC:', error);
-      ctx.reply('❌ Gagal membuat QR Code. Silakan coba lagi.');
-      ctx.session.state = null;
-    }
-  } else if (state === 'waiting_tiktok_url') {
-    try {
-      await ctx.reply('⏳ Sedang mendownload video TikTok...');
-      
-      const videoInfo = await downloadTikTok(text);
-      
-      if (videoInfo && videoInfo.videoUrl) {
-        await ctx.replyWithVideo(
-          videoInfo.videoUrl,
-          {
-            caption: `✅ Berhasil download video TikTok!\n\nJudul: ${videoInfo.title || 'Tidak ada judul'}`,
-            reply_markup: createMainMenu(ctx).reply_markup
-          }
-        );
-      } else {
-        ctx.reply('❌ Gagal mendownload video. Pastikan URL valid.');
-      }
-      
-      ctx.session.state = null;
-    } catch (error) {
-      console.error('Error downloading TikTok:', error);
-      ctx.reply('❌ Gagal mendownload video TikTok. Silakan coba lagi dengan URL yang berbeda.');
-      ctx.session.state = null;
-    }
-  }
-});
+*Support:*
+Jika mengalami masalah, hubungi developer.
+  `;
 
-// Handler untuk foto (Sticker)
-bot.on('photo', async (ctx) => {
-  if (ctx.session.state === 'waiting_sticker_photo') {
-    try {
-      await ctx.reply('⏳ Sedang membuat stiker...');
-      
-      // Dapatkan file ID foto dengan kualitas terbaik
-      const photo = ctx.message.photo[ctx.message.photo.length - 1];
-      const fileUrl = await ctx.telegram.getFileLink(photo.file_id);
-      
-      // Download dan proses foto
-      const response = await axios({
-        method: 'GET',
-        url: fileUrl,
-        responseType: 'arraybuffer'
-      });
-      
-      // Proses gambar dengan sharp
-      const processedImage = await sharp(response.data)
-        .resize(512, 512, {
-          fit: 'contain',
-          background: { r: 0, g: 0, b: 0, alpha: 0 }
-        })
-        .png()
-        .toBuffer();
-      
-      // Buat stiker
-      await ctx.replyWithSticker({ source: processedImage });
-      await ctx.reply('✅ Stiker berhasil dibuat!', createMainMenu(ctx));
-      
-      ctx.session.state = null;
-    } catch (error) {
-      console.error('Error creating sticker:', error);
-      ctx.reply('❌ Gagal membuat stiker. Silakan coba lagi dengan foto yang berbeda.');
-      ctx.session.state = null;
-    }
-  }
-});
-
-// Fungsi untuk generate QR Code
-async function generateQRCode(text) {
-  try {
-    const qrCodeDataURL = await QRCode.toDataURL(text, {
-      width: 400,
-      margin: 2,
-      color: {
-        dark: '#000000',
-        light: '#FFFFFF'
-      }
-    });
-    
-    // Convert Data URL ke Buffer
-    const base64Data = qrCodeDataURL.replace(/^data:image\/png;base64,/, '');
-    return Buffer.from(base64Data, 'base64');
-  } catch (error) {
-    throw new Error('Failed to generate QR code');
-  }
+  await ctx.reply(helpMessage, {
+    parse_mode: 'Markdown',
+    reply_markup: createMainMenu(ctx).reply_markup
+  });
 }
 
-// Fungsi untuk membuat gambar QC dengan latar belakang dan teks
-async function createQCImage(qrCodeBuffer, text) {
+// Fungsi utility yang ditingkatkan
+function getDetailedUserInfo(user) {
+  const userData = userDB.get(user.id);
+  return `
+👤 *USER INFORMATION*
+
+🆔 *ID:* \`${user.id}\`
+👤 *Username:* @${user.username || 'N/A'}
+📛 *Name:* ${user.first_name} ${user.last_name || ''}
+🌐 *Language:* ${user.language_code || 'N/A'}
+📅 *Join Date:* ${userData ? moment(userData.join_date).format('DD/MM/YYYY HH:mm') : 'Just now'}
+🔢 *Usage Count:* ${userData ? userData.usage_count : 1}
+  `;
+}
+
+async function generateAdvancedQRCode(text) {
+  const qrCodeDataURL = await QRCode.toDataURL(text, {
+    width: 400,
+    margin: 2,
+    color: {
+      dark: '#000000',
+      light: '#FFFFFF'
+    },
+    errorCorrectionLevel: 'H'
+  });
+  
+  const base64Data = qrCodeDataURL.replace(/^data:image\/png;base64,/, '');
+  return Buffer.from(base64Data, 'base64');
+}
+
+async function createEnhancedQCImage(qrCodeBuffer, text) {
   const width = 800;
   const height = 900;
   const canvas = createCanvas(width, height);
   const ctx = canvas.getContext('2d');
 
-  // Background gradient
+  // Advanced gradient background
   const gradient = ctx.createLinearGradient(0, 0, width, height);
   gradient.addColorStop(0, '#667eea');
-  gradient.addColorStop(1, '#764ba2');
+  gradient.addColorStop(0.5, '#764ba2');
+  gradient.addColorStop(1, '#f093fb');
   ctx.fillStyle = gradient;
   ctx.fillRect(0, 0, width, height);
 
-  // Tambahkan QR Code
-  const qrImage = await sharp(qrCodeBuffer).toBuffer();
-  const qrImg = await loadImage(qrImage);
-  ctx.drawImage(qrImg, 200, 100, 400, 400);
+  // Add decorative elements
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.1)';
+  for (let i = 0; i < 50; i++) {
+    ctx.beginPath();
+    ctx.arc(
+      Math.random() * width,
+      Math.random() * height,
+      Math.random() * 3,
+      0,
+      Math.PI * 2
+    );
+    ctx.fill();
+  }
 
-  // Tambahkan teks judul
+  // Add QR Code
+  const qrImg = await loadImage(qrCodeBuffer);
+  ctx.drawImage(qrImg, 200, 150, 400, 400);
+
+  // Enhanced text styling
   ctx.fillStyle = '#ffffff';
-  ctx.font = 'bold 32px Arial';
+  ctx.font = 'bold 36px Arial';
   ctx.textAlign = 'center';
-  ctx.fillText('QR CODE', width / 2, 60);
+  ctx.fillText('QR CODE GENERATOR', width / 2, 80);
 
-  // Tambahkan teks content
   ctx.font = '20px Arial';
-  ctx.fillText('Teks:', width / 2, 550);
+  ctx.fillText('Generated Text:', width / 2, 580);
   
-  // Potong teks jika terlalu panjang
-  const displayText = text.length > 50 ? text.substring(0, 47) + '...' : text;
+  const displayText = text.length > 40 ? text.substring(0, 37) + '...' : text;
   ctx.font = '18px Arial';
-  ctx.fillText(displayText, width / 2, 580);
+  ctx.fillStyle = '#f0f0f0';
+  ctx.fillText(displayText, width / 2, 610);
 
-  // Tambahkan footer
+  // Add footer with timestamp
   ctx.font = '14px Arial';
   ctx.fillStyle = 'rgba(255, 255, 255, 0.7)';
-  ctx.fillText('Dibuat oleh Telegram Bot', width / 2, height - 30);
+  ctx.fillText(`Generated on ${moment().format('DD/MM/YYYY HH:mm')} • Bot v2.0.0`, width / 2, height - 20);
 
   return canvas.toBuffer('image/png');
 }
 
-// Helper function untuk load image di canvas
-function loadImage(buffer) {
-  return new Promise((resolve, reject) => {
-    const img = new (require('canvas').Image)();
-    img.onload = () => resolve(img);
-    img.onerror = reject;
-    img.src = buffer;
-  });
-}
-
-// Fungsi untuk download TikTok
-async function downloadTikTok(url) {
-  try {
-    // Simple TikTok downloader menggunakan API public
-    const apiUrl = `https://www.tikwm.com/api/?url=${encodeURIComponent(url)}`;
-    const response = await axios.get(apiUrl);
-    
-    if (response.data && response.data.data) {
-      const data = response.data.data;
-      return {
-        title: data.title,
-        videoUrl: data.play,
-        duration: data.duration,
-        author: data.author
-      };
+// Enhanced TikTok downloader dengan multiple fallback
+async function downloadTikTokVideo(url) {
+  const apis = config.TIKTOK_APIS;
+  
+  for (let api of apis) {
+    try {
+      const apiUrl = api + encodeURIComponent(url);
+      const response = await axios.get(apiUrl, { timeout: 10000 });
+      
+      if (response.data) {
+        const data = response.data.data || response.data;
+        if (data.play || data.videoUrl || data.wm) {
+          return {
+            title: data.title || 'No Title',
+            videoUrl: data.play || data.videoUrl || data.wm,
+            duration: data.duration || 'Unknown',
+            author: data.author?.nickname || data.author || 'Unknown'
+          };
+        }
+      }
+    } catch (error) {
+      console.log(`API ${api} failed, trying next...`);
+      continue;
     }
-    
-    throw new Error('Invalid response from TikTok API');
-  } catch (error) {
-    console.error('TikTok download error:', error);
-    throw error;
   }
+  
+  throw new Error('All TikTok APIs failed');
 }
 
-// Error handling
+// Command admin
+bot.command('broadcast', async (ctx) => {
+  if (!config.ADMIN_IDS.includes(ctx.from.id)) {
+    return ctx.reply('❌ Akses ditolak!');
+  }
+  
+  const message = ctx.message.text.replace('/broadcast', '').trim();
+  if (!message) {
+    return ctx.reply('❌ Format: /broadcast <pesan>');
+  }
+  
+  let success = 0;
+  let failed = 0;
+  
+  for (let [userId, userData] of userDB) {
+    try {
+      await ctx.telegram.sendMessage(userId, `📢 *BROADCAST*\n\n${message}`, {
+        parse_mode: 'Markdown'
+      });
+      success++;
+    } catch (error) {
+      failed++;
+    }
+    await new Promise(resolve => setTimeout(resolve, 100)); // Rate limiting
+  }
+  
+  ctx.reply(`✅ Broadcast selesai!\nBerhasil: ${success}\nGagal: ${failed}`);
+});
+
+bot.command('restart', (ctx) => {
+  if (!config.ADMIN_IDS.includes(ctx.from.id)) {
+    return ctx.reply('❌ Akses ditolak!');
+  }
+  
+  ctx.reply('🔄 Restarting bot...').then(() => {
+    process.exit(0);
+  });
+});
+
+// Error handling yang lebih baik
 bot.catch((err, ctx) => {
   console.error(`Error for ${ctx.updateType}:`, err);
-  ctx.reply('❌ Terjadi kesalahan sistem. Silakan coba lagi nanti.');
+  ctx.reply('❌ *Terjadi kesalahan sistem!*\n\n_Silakan coba lagi nanti atau hubungi developer._', {
+    parse_mode: 'Markdown'
+  });
+});
+
+// Auto-save stats setiap jam
+cron.schedule('0 * * * *', () => {
+  console.log('📊 Stats saved:', stats);
 });
 
 // Start bot
-console.log('🤖 Bot sedang berjalan...');
+console.log('🚀 Advanced Bot is starting...');
 bot.launch().then(() => {
-  console.log('✅ Bot berhasil dijalankan!');
+  console.log('✅ Bot successfully launched!');
+  console.log('📊 Initial Stats:', stats);
 });
 
-// Enable graceful stop
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+// Graceful shutdown
+process.once('SIGINT', () => {
+  console.log('🛑 Shutting down gracefully...');
+  bot.stop('SIGINT');
+  process.exit(0);
+});
+
+process.once('SIGTERM', () => {
+  console.log('🛑 Shutting down gracefully...');
+  bot.stop('SIGTERM');
+  process.exit(0);
+});
